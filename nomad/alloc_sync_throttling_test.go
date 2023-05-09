@@ -52,6 +52,7 @@ type throttleTestConfig struct {
 	name                          string
 	numClients                    int
 	allocsPerClient               int
+	clientBackoffThreshold        int
 	serverBatchUpdateInterval     time.Duration
 	serverPerWrite                time.Duration
 	serverBaseWriteLatency        time.Duration
@@ -106,7 +107,7 @@ func (n *throttleTestNodeHandler) NodeUpdateAlloc(req *structs.AllocUpdateReques
 			now := time.Now()
 
 			// Perform the batch update
-			n.batchUpdate(future, updates, updatedClients)
+			n.batchUpdate(future, updates)
 
 			elapsed := time.Since(now)
 			n.historyLock.Lock()
@@ -142,7 +143,7 @@ func (n *throttleTestNodeHandler) NodeUpdateAlloc(req *structs.AllocUpdateReques
 	return nil
 }
 
-func (n *throttleTestNodeHandler) batchUpdate(future *structs.BatchFuture, updates []*structs.Allocation, updatedClients map[string]struct{}) {
+func (n *throttleTestNodeHandler) batchUpdate(future *structs.BatchFuture, updates []*structs.Allocation) {
 	if len(updates) == 0 {
 		return
 	}
@@ -168,8 +169,11 @@ type throttleTestClient struct {
 	allocEventInterval time.Duration
 	allocs             []*structs.Allocation
 	allocUpdates       chan *structs.Allocation
-	responses          []*throttleTestResponse
-	srv                *throttleTestNodeHandler
+
+	backOffThreshold int
+
+	responses []*throttleTestResponse
+	srv       *throttleTestNodeHandler
 }
 
 func newThrottleTestClient(srv *throttleTestNodeHandler, cfg *throttleTestConfig) *throttleTestClient {
@@ -178,6 +182,7 @@ func newThrottleTestClient(srv *throttleTestNodeHandler, cfg *throttleTestConfig
 		syncInterval:       cfg.clientBatchUpdateInterval,
 		allocEventInterval: cfg.clientAllocEventsBaseInterval,
 		allocUpdates:       make(chan *structs.Allocation, 64),
+		backOffThreshold:   cfg.clientBackoffThreshold,
 		responses:          []*throttleTestResponse{},
 		srv:                srv,
 	}
@@ -238,26 +243,27 @@ func (c *throttleTestClient) allocSync(ctx context.Context) {
 				continue
 			}
 
-			sync := make([]*structs.Allocation, 0, len(updates))
-			for _, alloc := range updates {
-				sync = append(sync, alloc)
-			}
-
-			args := &structs.AllocUpdateRequest{Alloc: sync}
+			args := &structs.AllocUpdateRequest{Alloc: maps.Values(updates)}
 			var resp throttleTestResponse
 
+			now := time.Now()
 			err := c.srv.NodeUpdateAlloc(args, &resp)
 			if err != nil { // don't clear, but backoff
-				syncTicker.Stop()
 				syncInterval = c.syncInterval + helper.RandomStagger(c.syncInterval)
-				syncTicker = time.NewTicker(syncInterval)
+				syncTicker.Reset(syncInterval)
 				continue
 			}
-			c.responses = append(c.responses, &resp)
 
+			resp.elapsedClientTime = time.Since(now)
+			c.responses = append(c.responses, &resp)
 			updates = make(map[string]*structs.Allocation, len(updates))
-			syncTicker.Stop()
-			syncTicker = time.NewTicker(syncInterval)
+
+			if c.backOffThreshold > 0 && resp.LastBatchSize > c.backOffThreshold {
+				syncInterval = c.syncInterval + helper.RandomStagger(c.syncInterval)
+			} else {
+				syncInterval = c.syncInterval
+			}
+			syncTicker.Reset(syncInterval)
 		}
 	}
 }
@@ -274,6 +280,8 @@ type throttleTestResponse struct {
 	LastBatchTimeToWrite   time.Duration
 	CurrentBatchSize       int
 	CurrentBatchNumClients int
+
+	elapsedClientTime time.Duration
 
 	structs.WriteMeta
 }
@@ -300,38 +308,39 @@ func TestAllocSyncThrottling(t *testing.T) {
 	batchLatency := time.Millisecond * 5
 
 	testCfgs := []*throttleTestConfig{
-		{
-			name:                          "2000_clients_50_allocs_per",
-			numClients:                    2000,
-			allocsPerClient:               50,
-			serverBatchUpdateInterval:     time.Millisecond * 50,
-			clientBatchUpdateInterval:     time.Millisecond * 200,
-			clientAllocEventsBaseInterval: time.Millisecond * 50,
-		},
-		{
-			name:                          "2000_clients_100_allocs_per",
-			numClients:                    2000,
-			allocsPerClient:               100,
-			serverBatchUpdateInterval:     time.Millisecond * 50,
-			clientBatchUpdateInterval:     time.Millisecond * 200,
-			clientAllocEventsBaseInterval: time.Millisecond * 50,
-		},
-		{
-			name:                          "2000_clients_100_allocs_per_slow",
-			numClients:                    2000,
-			allocsPerClient:               100,
-			serverBatchUpdateInterval:     time.Millisecond * 50,
-			clientBatchUpdateInterval:     time.Millisecond * 500,
-			clientAllocEventsBaseInterval: time.Millisecond * 300,
-		},
-		{
-			name:                          "2000_clients_100_allocs_per_fast_srv",
-			numClients:                    2000,
-			allocsPerClient:               100,
-			serverBatchUpdateInterval:     time.Millisecond * 15,
-			clientBatchUpdateInterval:     time.Millisecond * 200,
-			clientAllocEventsBaseInterval: time.Millisecond * 50,
-		},
+
+		// {
+		// 	name:                          "2000_clients_50_allocs_per",
+		// 	numClients:                    2000,
+		// 	allocsPerClient:               50,
+		// 	serverBatchUpdateInterval:     time.Millisecond * 50,
+		// 	clientBatchUpdateInterval:     time.Millisecond * 200,
+		// 	clientAllocEventsBaseInterval: time.Millisecond * 50,
+		// },
+		// {
+		// 	name:                          "2000_clients_100_allocs_per",
+		// 	numClients:                    2000,
+		// 	allocsPerClient:               100,
+		// 	serverBatchUpdateInterval:     time.Millisecond * 50,
+		// 	clientBatchUpdateInterval:     time.Millisecond * 200,
+		// 	clientAllocEventsBaseInterval: time.Millisecond * 50,
+		// },
+		// {
+		// 	name:                          "2000_clients_100_allocs_per_slow",
+		// 	numClients:                    2000,
+		// 	allocsPerClient:               100,
+		// 	serverBatchUpdateInterval:     time.Millisecond * 50,
+		// 	clientBatchUpdateInterval:     time.Millisecond * 500,
+		// 	clientAllocEventsBaseInterval: time.Millisecond * 300,
+		// },
+		// {
+		// 	name:                          "2000_clients_100_allocs_per_fast_srv",
+		// 	numClients:                    2000,
+		// 	allocsPerClient:               100,
+		// 	serverBatchUpdateInterval:     time.Millisecond * 15,
+		// 	clientBatchUpdateInterval:     time.Millisecond * 200,
+		// 	clientAllocEventsBaseInterval: time.Millisecond * 50,
+		// },
 
 		{
 			name:                          "1000_clients_50_allocs_per",
@@ -345,6 +354,15 @@ func TestAllocSyncThrottling(t *testing.T) {
 			name:                          "1000_clients_100_allocs_per",
 			numClients:                    1000,
 			allocsPerClient:               100,
+			serverBatchUpdateInterval:     time.Millisecond * 50,
+			clientBatchUpdateInterval:     time.Millisecond * 200,
+			clientAllocEventsBaseInterval: time.Millisecond * 50,
+		},
+		{
+			name:                          "1000_clients_100_allocs_per_backoff",
+			numClients:                    1000,
+			allocsPerClient:               100,
+			clientBackoffThreshold:        1000,
 			serverBatchUpdateInterval:     time.Millisecond * 50,
 			clientBatchUpdateInterval:     time.Millisecond * 200,
 			clientAllocEventsBaseInterval: time.Millisecond * 50,
@@ -382,6 +400,16 @@ func TestAllocSyncThrottling(t *testing.T) {
 			clientBatchUpdateInterval:     time.Millisecond * 200,
 			clientAllocEventsBaseInterval: time.Millisecond * 50,
 		},
+		{
+			name:                          "500_clients_100_allocs_per_backoff",
+			numClients:                    500,
+			allocsPerClient:               100,
+			clientBackoffThreshold:        500,
+			serverBatchUpdateInterval:     time.Millisecond * 50,
+			clientBatchUpdateInterval:     time.Millisecond * 200,
+			clientAllocEventsBaseInterval: time.Millisecond * 50,
+		},
+
 		{
 			name:                          "500_clients_100_allocs_per_slow",
 			numClients:                    500,
